@@ -13,7 +13,7 @@
 //! Bear in mind that you will have to take care of timing requirements
 //! yourself then.
 
-use cortex_m::{self, singleton};
+use cortex_m::{self, prelude::_embedded_hal_blocking_delay_DelayUs, singleton};
 use fugit::HertzU32;
 // use morton_encoding::morton_encode;
 use rp2040_hal::{
@@ -29,6 +29,13 @@ use smart_leds_trait::RGB8;
 pub struct LEDs<const SIZE: usize, K: Into<RGB8>> {
     pub channel0: [K; SIZE],
     pub channel1: [K; SIZE],
+}
+
+#[macro_export]
+macro_rules! buf {
+    ($size:expr) => {
+        singleton!(: [u32; $size * 2] = [0; $size * 2]).unwrap()
+    };
 }
 
 pub type LEDBuf<const SIZE: usize> = [u32; SIZE];
@@ -323,14 +330,21 @@ where
         }
     }
 
-    pub fn write<const S: usize, K>(mut self, leds: &LEDs<S, K>) -> Self
+    pub fn write<const S: usize, K, D: DelayUs>(
+        mut self,
+        delayer: &mut D,
+        leds: &LEDs<S, K>,
+    ) -> Self
     where
         K: Into<RGB8> + Copy,
     {
         // TODO: ugh just make this an iterator and if it's too big, whatever, i guess?
-        assert!(BS == S * 2, "buffer sizes must be twice the LED count");
+        assert!(BS == S * 2, "buffer sizes must be LED count * 2");
 
         let (tx_buf, next_tx_transfer) = self.tx_transfer.wait();
+
+        // make sure last value has latched
+        delayer.delay_us(300);
 
         leds.fill(tx_buf);
 
@@ -344,6 +358,15 @@ where
     //     self.tx_transfer = next_tx_transfer.read_next(tx_buf);
     //     self
     // }
+}
+
+/// Microsecond delay
+///
+/// `UXX` denotes the range type of the delay time. `UXX` can be `u8`, `u16`, etc. A single type can
+/// implement this trait for different types of `UXX`.
+pub trait DelayUs {
+    /// Pauses execution for `us` microseconds
+    fn delay_us(&mut self, us: u32);
 }
 
 /*
