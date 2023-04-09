@@ -43,37 +43,72 @@ pub type LEDBuf<const SIZE: usize> = [u32; SIZE];
 // https://graphics.stanford.edu/~seander/bithacks.html#InterleaveBMN
 impl<const S: usize, K: Into<RGB8> + Copy> LEDs<S, K> {
     pub fn fill<const BS: usize>(&self, buf: &mut LEDBuf<BS>) {
+        let mut buf_i = 0;
         for i in 0..S {
             let c1: RGB8 = self.channel0[i].into();
-            let word1 = (u32::from(c1.g) << 24) | (u32::from(c1.r) << 16) | (u32::from(c1.b) << 8);
             let c2: RGB8 = self.channel1[i].into();
-            let word2 = (u32::from(c2.g) << 24) | (u32::from(c2.r) << 16) | (u32::from(c2.b) << 8);
-            let smushed = morton_encode(word1, word2);
+            let g = morton_encode_u8(c1.g, c2.g);
+            let r = morton_encode_u8(c1.r, c2.r);
+            let b = morton_encode_u8(c1.b, c2.b);
 
-            // gotta fit these back into u32s, so split em up:
-            // high bits: 0xAABB -> shift, 0x00AA -> truncate, 0xAA
-            buf[2 * i] = (smushed >> 32) as u32;
-            // low bits: 0xAABB -> truncate, 0xBB
-            buf[2 * i + 1] = smushed as u32;
+            if i % 2 == 0 {
+                buf[buf_i] = u32::from(g) << 16 | u32::from(r);
+                buf[buf_i + 1] = u32::from(b) << 16;
+                buf_i += 1
+            } else {
+                buf[buf_i] |= u32::from(g);
+                buf[buf_i + 1] = u32::from(r) << 16 | u32::from(b);
+                buf_i += 2
+            }
         }
     }
 }
 
-fn morton_encode(x: u32, y: u32) -> u64 {
+pub fn morton_encode_u8(x: u8, y: u8) -> u16 {
     // insert a 0 bit between each of the 32 bits of x and y
     // (truncated) example:
     // 0b1111 -> double size, 0b00001111 -> bloat 0b01010101
-    let x = bloat(x);
-    let y = bloat(y);
+    let x = bloat_u8(x);
+    let y = bloat_u8(y);
 
     // bump x 1 bit to the left, and smush it together with y
     // (truncated) example:
     // 0b01010101 ----------------> 0b11111111
     // 0b01010101 -> 0b10101010 -'
-    (x << 1) | y
+    (y << 1) | x
 }
 
-fn bloat(x: u32) -> u64 {
+fn bloat_u8(x: u8) -> u16 {
+    // x = ---- ---- ---- ---- ---- ---- ---- ---- fedc ba98 7654 3210 fedc ba98 7654 3210
+    const masks: [(u8, u16); 3] = [
+        (4, 0x0f0f), //  ---- fedc ---- ba98
+        (2, 0x3333), //  --fe --dc --ba --98
+        (1, 0x5555), //  -f-e -d-c -b-a -9-8
+    ];
+    let mut x = x as u16;
+
+    x = (x ^ (x << masks[0].0)) & masks[0].1;
+    x = (x ^ (x << masks[1].0)) & masks[1].1;
+    x = (x ^ (x << masks[2].0)) & masks[2].1;
+
+    x
+}
+
+pub fn morton_encode_u32(x: u32, y: u32) -> u64 {
+    // insert a 0 bit between each of the 32 bits of x and y
+    // (truncated) example:
+    // 0b1111 -> double size, 0b00001111 -> bloat 0b01010101
+    let x = bloat_u32(x);
+    let y = bloat_u32(y);
+
+    // bump x 1 bit to the left, and smush it together with y
+    // (truncated) example:
+    // 0b01010101 ----------------> 0b11111111
+    // 0b01010101 -> 0b10101010 -'
+    (y << 1) | x
+}
+
+fn bloat_u32(x: u32) -> u64 {
     // x = ---- ---- ---- ---- ---- ---- ---- ---- fedc ba98 7654 3210 fedc ba98 7654 3210
     const masks: [(u8, u64); 5] = [
         (16, 0x0000ffff0000ffff), // ---- ---- ---- ---- fedc ba98 7654 3210 ---- ---- ---- ---- fedc ba98 7654 3210
@@ -309,7 +344,6 @@ where
             // OSR config
             .out_shift_direction(rp2040_hal::pio::ShiftDirection::Left)
             .autopull(true)
-            .pull_threshold(24)
             .clock_divisor_fixed_point(int, frac)
             .build(sm);
 
@@ -339,6 +373,7 @@ where
         K: Into<RGB8> + Copy,
     {
         // TODO: ugh just make this an iterator and if it's too big, whatever, i guess?
+        // TODO: double is not right though? it's like... (*2)/3?
         assert!(BS == S * 2, "buffer sizes must be LED count * 2");
 
         let (tx_buf, next_tx_transfer) = self.tx_transfer.wait();
