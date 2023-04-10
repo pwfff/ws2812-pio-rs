@@ -22,7 +22,7 @@ use rp2040_hal::{
         ReadTarget, SingleChannel,
     },
     gpio::{Function, FunctionConfig, Pin, PinId, ValidPinMode},
-    pio::{PIOExt, StateMachineIndex, Tx, UninitStateMachine, PIO},
+    pio::{InstalledProgram, PIOExt, StateMachineIndex, Tx, UninitStateMachine, PIO},
 };
 use smart_leds_trait::RGB8;
 
@@ -128,6 +128,118 @@ fn bloat_u32(x: u32) -> u64 {
     x
 }
 
+pub fn init<P: PIOExt + FunctionConfig>(pio: &mut PIO<P>) -> InstalledProgram<P> {
+    // better (?) implementation from adafruit? https://learn.adafruit.com/intro-to-rp2040-pio-with-circuitpython/using-pio-to-drive-a-neopixel
+    /*
+    .program ws2812
+    .side_set 1
+    .wrap_target
+    bitloop:
+       out x 1        side 0 [6]; Drive low. Side-set still takes place before instruction stalls.
+       jmp !x do_zero side 1 [3]; Branch on the bit we shifted out previous delay. Drive high.
+     do_one:
+       jmp  bitloop   side 1 [4]; Continue driving high, for a one (long pulse)
+     do_zero:
+       nop            side 0 [4]; Or drive low, for a zero (short pulse)
+    .wrap
+    */
+
+    // cycle times here are: _______----_____
+    // 7 (out + 6), - low    _______---------
+    // 4 (jmp + 3), - high
+    // 5 (jmp/nop + 4) - high/low
+    // = 16
+
+    // left side is branch target
+    // X--
+    // |\
+    // | - was 00, write 11 for 4, 00 for 5, wrap
+    // X-1
+    // |\- was 01, write 11 for 4, 01 for 5, wrap
+    // X-2
+    // |\- was 10, write 11 for 4, 10 for 5, wrap
+    // X-3
+    // \-  was 11, write 11 for 9, wrap
+
+    // modified to drive two pins from one bitstream.
+    // note that the bitstream must be pre-munged.
+    /*
+    .program ws2812
+    .side_set 2;                      we'll be side-setting two bits at a time to drive the two pins
+    .wrap_target
+    bitloop:
+        out x 2        side 0b00 [0]; drive pins low, get pin bits. side-set still takes place before instruction stalls. cycle: 1
+        jmp x-- do_01  side 0b00 [0]; branch-then-decrement when X > 0. delay always happens.                                     2
+        nop            side 0b00 [4]; finish low period.                                                                           3---7
+        nop            side 0b11 [3]; single high pulse for both.                                                                       8-11      _______----_____
+        jmp bitloop    side 0b00 [4]; low pulse for both 0s, back to beginning.                                                             12-16 _______----_____
+    do_01:
+        jmp x-- do_10  side 0b00 [0]; branch-then-decrement when X > 0.                                                            3
+        nop            side 0b00 [3]; finish low period.                                                                            4--7
+        nop            side 0b11 [3]; single high pulse for both.                                                                       8-11      _______----_____
+        jmp bitloop    side 0b01 [4]; low pulse for pin0, high pulse for pin1, back to beginning.                                           12-16 _______---------
+    do_10:
+        jmp x-- do_11  side 0b00 [0]; branch-then-decrement when X > 0.                                                             4
+        nop            side 0b00 [2]; finish low period.                                                                             5-7
+        nop            side 0b11 [3]; single high pulse for both.                                                                       8-11      _______---------
+        jmp bitloop    side 0b10 [4]; low pulse for pin0, high pulse for pin1, back to beginning.                                           12-16 _______----_____
+    do_11:
+        nop            side 0b00 [2]; finish low period.                                                                             5-7           _______---------
+        nop            side 0b11 [7]; single high pulse for both, all the way through.                                                  8------16  _______---------
+        nop            side 0b11 [0]; how embarassing, we can't delay for 8...
+    .wrap
+    */
+
+    // prepare the PIO program
+    let side_set = pio::SideSet::new(false, 2, false);
+    let mut a = pio::Assembler::new_with_side_set(side_set);
+
+    let mut wrap_target = a.label(); // also bitloop
+    let mut wrap_source = a.label();
+    let mut do_01 = a.label();
+    let mut do_10 = a.label();
+    let mut do_11 = a.label();
+    a.bind(&mut wrap_target);
+    // drive pins low, get our two bits. side-set still takes place even if stalled.
+    a.out_with_delay_and_side_set(pio::OutDestination::X, 2, 0, 0b00);
+    // check if x > 0, jumping if so. always decrements. still no delay, side-set still 0.
+    a.jmp_with_delay_and_side_set(pio::JmpCondition::XDecNonZero, &mut do_01, 0, 0b00);
+    // if x was 0, both our bits are low, so finish our initial low period, do a short high then low.
+    a.nop_with_delay_and_side_set(4, 0b00);
+    a.nop_with_delay_and_side_set(3, 0b11);
+    a.jmp_with_delay_and_side_set(pio::JmpCondition::Always, &mut wrap_target, 4, 0b00);
+
+    // if x was > 0, we jumped here.
+    a.bind(&mut do_01);
+    // check if x > 0 again, jumping if so. always decrements. still no delay, side-set still 0.
+    a.jmp_with_delay_and_side_set(pio::JmpCondition::XDecNonZero, &mut do_10, 0, 0b00);
+    // if x was 0 here, we got 0b01, so finish initial low, do a short high, then low for pin 1 and high for pin 0.
+    a.nop_with_delay_and_side_set(3, 0b00);
+    a.nop_with_delay_and_side_set(3, 0b11);
+    a.jmp_with_delay_and_side_set(pio::JmpCondition::Always, &mut wrap_target, 4, 0b01);
+
+    // if x was still > 0, we jumped here.
+    a.bind(&mut do_10);
+    // check if x > 0 again, jumping if so. always decrements. still no delay, side-set still 0. (could be just !x i guess)
+    a.jmp_with_delay_and_side_set(pio::JmpCondition::XDecNonZero, &mut do_11, 0, 0b00);
+    // if x was 0 here, we got 0b10, so finish initial low, do a short high, then high for pin 1 and low for pin 0.
+    a.nop_with_delay_and_side_set(2, 0b00);
+    a.nop_with_delay_and_side_set(3, 0b11);
+    a.jmp_with_delay_and_side_set(pio::JmpCondition::Always, &mut wrap_target, 4, 0b10);
+
+    // finally, x must have been 0b11
+    a.bind(&mut do_11);
+    // finish initial low, do a short high, then high for pin 1 and low for pin 0.
+    a.nop_with_delay_and_side_set(2, 0b00);
+    a.nop_with_delay_and_side_set(7, 0b11);
+    a.nop_with_delay_and_side_set(0, 0b11);
+    a.bind(&mut wrap_source);
+    let program = a.assemble_with_wrap(wrap_source, wrap_target);
+
+    // Install the program into PIO instruction memory.
+    pio.install(&program).unwrap()
+}
+
 /// This is the WS2812 PIO Driver.
 ///
 /// For blocking applications is recommended to use
@@ -190,9 +302,9 @@ where
 {
     /// Creates a new instance of this driver.
     pub fn new(
+        installed: InstalledProgram<P>,
         pin0: Pin<I, Function<P>>,
         pin1: Pin<J, Function<P>>,
-        pio: &mut PIO<P>,
         dma: (CH1, CH2),
         buf0: &'static mut LEDBuf<BS>,
         buf1: &'static mut LEDBuf<BS>,
@@ -204,118 +316,8 @@ where
             "Provided pins must be next to each other"
         );
 
-        // better (?) implementation from adafruit? https://learn.adafruit.com/intro-to-rp2040-pio-with-circuitpython/using-pio-to-drive-a-neopixel
-        /*
-        .program ws2812
-        .side_set 1
-        .wrap_target
-        bitloop:
-           out x 1        side 0 [6]; Drive low. Side-set still takes place before instruction stalls.
-           jmp !x do_zero side 1 [3]; Branch on the bit we shifted out previous delay. Drive high.
-         do_one:
-           jmp  bitloop   side 1 [4]; Continue driving high, for a one (long pulse)
-         do_zero:
-           nop            side 0 [4]; Or drive low, for a zero (short pulse)
-        .wrap
-        */
-
-        // cycle times here are: _______----_____
-        // 7 (out + 6), - low    _______---------
-        // 4 (jmp + 3), - high
-        // 5 (jmp/nop + 4) - high/low
-        // = 16
-
-        // left side is branch target
-        // X--
-        // |\
-        // | - was 00, write 11 for 4, 00 for 5, wrap
-        // X-1
-        // |\- was 01, write 11 for 4, 01 for 5, wrap
-        // X-2
-        // |\- was 10, write 11 for 4, 10 for 5, wrap
-        // X-3
-        // \-  was 11, write 11 for 9, wrap
-
-        // modified to drive two pins from one bitstream.
-        // note that the bitstream must be pre-munged.
-        /*
-        .program ws2812
-        .side_set 2;                      we'll be side-setting two bits at a time to drive the two pins
-        .wrap_target
-        bitloop:
-            out x 2        side 0b00 [0]; drive pins low, get pin bits. side-set still takes place before instruction stalls. cycle: 1
-            jmp x-- do_01  side 0b00 [0]; branch-then-decrement when X > 0. delay always happens.                                     2
-            nop            side 0b00 [4]; finish low period.                                                                           3---7
-            nop            side 0b11 [3]; single high pulse for both.                                                                       8-11      _______----_____
-            jmp bitloop    side 0b00 [4]; low pulse for both 0s, back to beginning.                                                             12-16 _______----_____
-        do_01:
-            jmp x-- do_10  side 0b00 [0]; branch-then-decrement when X > 0.                                                            3
-            nop            side 0b00 [3]; finish low period.                                                                            4--7
-            nop            side 0b11 [3]; single high pulse for both.                                                                       8-11      _______----_____
-            jmp bitloop    side 0b01 [4]; low pulse for pin0, high pulse for pin1, back to beginning.                                           12-16 _______---------
-        do_10:
-            jmp x-- do_11  side 0b00 [0]; branch-then-decrement when X > 0.                                                             4
-            nop            side 0b00 [2]; finish low period.                                                                             5-7
-            nop            side 0b11 [3]; single high pulse for both.                                                                       8-11      _______---------
-            jmp bitloop    side 0b10 [4]; low pulse for pin0, high pulse for pin1, back to beginning.                                           12-16 _______----_____
-        do_11:
-            nop            side 0b00 [2]; finish low period.                                                                             5-7           _______---------
-            nop            side 0b11 [7]; single high pulse for both, all the way through.                                                  8------16  _______---------
-            nop            side 0b11 [0]; how embarassing, we can't delay for 8...
-        .wrap
-        */
-
-        // prepare the PIO program
-        let side_set = pio::SideSet::new(false, 2, false);
-        let mut a = pio::Assembler::new_with_side_set(side_set);
-
         const CYCLES_PER_BIT: u32 = 16;
         const FREQ: HertzU32 = HertzU32::kHz(800);
-
-        let mut wrap_target = a.label(); // also bitloop
-        let mut wrap_source = a.label();
-        let mut do_01 = a.label();
-        let mut do_10 = a.label();
-        let mut do_11 = a.label();
-        a.bind(&mut wrap_target);
-        // drive pins low, get our two bits. side-set still takes place even if stalled.
-        a.out_with_delay_and_side_set(pio::OutDestination::X, 2, 0, 0b00);
-        // check if x > 0, jumping if so. always decrements. still no delay, side-set still 0.
-        a.jmp_with_delay_and_side_set(pio::JmpCondition::XDecNonZero, &mut do_01, 0, 0b00);
-        // if x was 0, both our bits are low, so finish our initial low period, do a short high then low.
-        a.nop_with_delay_and_side_set(4, 0b00);
-        a.nop_with_delay_and_side_set(3, 0b11);
-        a.jmp_with_delay_and_side_set(pio::JmpCondition::Always, &mut wrap_target, 4, 0b00);
-
-        // if x was > 0, we jumped here.
-        a.bind(&mut do_01);
-        // check if x > 0 again, jumping if so. always decrements. still no delay, side-set still 0.
-        a.jmp_with_delay_and_side_set(pio::JmpCondition::XDecNonZero, &mut do_10, 0, 0b00);
-        // if x was 0 here, we got 0b01, so finish initial low, do a short high, then low for pin 1 and high for pin 0.
-        a.nop_with_delay_and_side_set(3, 0b00);
-        a.nop_with_delay_and_side_set(3, 0b11);
-        a.jmp_with_delay_and_side_set(pio::JmpCondition::Always, &mut wrap_target, 4, 0b01);
-
-        // if x was still > 0, we jumped here.
-        a.bind(&mut do_10);
-        // check if x > 0 again, jumping if so. always decrements. still no delay, side-set still 0. (could be just !x i guess)
-        a.jmp_with_delay_and_side_set(pio::JmpCondition::XDecNonZero, &mut do_11, 0, 0b00);
-        // if x was 0 here, we got 0b10, so finish initial low, do a short high, then high for pin 1 and low for pin 0.
-        a.nop_with_delay_and_side_set(2, 0b00);
-        a.nop_with_delay_and_side_set(3, 0b11);
-        a.jmp_with_delay_and_side_set(pio::JmpCondition::Always, &mut wrap_target, 4, 0b10);
-
-        // finally, x must have been 0b11
-        a.bind(&mut do_11);
-        // finish initial low, do a short high, then high for pin 1 and low for pin 0.
-        a.nop_with_delay_and_side_set(2, 0b00);
-        a.nop_with_delay_and_side_set(7, 0b11);
-        a.nop_with_delay_and_side_set(0, 0b11);
-        a.bind(&mut wrap_source);
-        let program = a.assemble_with_wrap(wrap_source, wrap_target);
-
-        // Install the program into PIO instruction memory.
-        let installed = pio.install(&program).unwrap();
 
         // Configure the PIO state machine.
         let bit_freq = FREQ * CYCLES_PER_BIT;
