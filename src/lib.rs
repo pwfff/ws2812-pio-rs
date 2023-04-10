@@ -31,6 +31,7 @@ pub struct LEDs<const SIZE: usize, K: Into<RGB8>> {
     pub channel1: [K; SIZE],
 }
 
+// TODO: buffer size only needs to be like... * 3/2?
 #[macro_export]
 macro_rules! buf {
     ($size:expr) => {
@@ -45,6 +46,8 @@ impl<const S: usize, K: Into<RGB8> + Copy> LEDs<S, K> {
     pub fn fill<const BS: usize>(&self, buf: &mut LEDBuf<BS>) {
         let mut buf_i = 0;
         for i in 0..S {
+            // TODO: faster to encode_u8 thrice,
+            //  or encode_u32 once and throw away last byte?
             let c1: RGB8 = self.channel0[i].into();
             let c2: RGB8 = self.channel1[i].into();
             let g = morton_encode_u8(c1.g, c2.g);
@@ -397,10 +400,6 @@ where
     // }
 }
 
-/// Microsecond delay
-///
-/// `UXX` denotes the range type of the delay time. `UXX` can be `u8`, `u16`, etc. A single type can
-/// implement this trait for different types of `UXX`.
 pub trait DelayUs {
     /// Pauses execution for `us` microseconds
     fn delay_us(&mut self, us: u32);
