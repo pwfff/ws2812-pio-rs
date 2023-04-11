@@ -34,6 +34,12 @@ pub struct LEDs<const SIZE: usize, K: Into<RGB8>> {
     pub channel1: [K; SIZE],
 }
 
+impl<const SIZE: usize, K: Into<RGB8>> LEDs<SIZE, K> {
+    pub fn new(channel0: [K; SIZE], channel1: [K; SIZE]) -> Self {
+        Self { channel0, channel1 }
+    }
+}
+
 // TODO: buffer size only needs to be like... * 3/2?
 #[macro_export]
 macro_rules! buf {
