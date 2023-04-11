@@ -13,13 +13,16 @@
 //! Bear in mind that you will have to take care of timing requirements
 //! yourself then.
 
-use cortex_m::{self, prelude::_embedded_hal_blocking_delay_DelayUs, singleton};
-use fugit::HertzU32;
+use cortex_m::{self};
+use fugit::{ExtU32, HertzU32, HertzU64};
 // use morton_encoding::morton_encode;
+use defmt::info;
+use defmt_rtt as _;
+use nb::block;
 use rp2040_hal::{
     dma::{
         double_buffer::{Config, ReadNext, Transfer},
-        ReadTarget, SingleChannel,
+        SingleChannel,
     },
     gpio::{Function, FunctionConfig, Pin, PinId, ValidPinMode},
     pio::{InstalledProgram, PIOExt, StateMachineIndex, Tx, UninitStateMachine, PIO},
@@ -275,7 +278,7 @@ pub fn init<P: PIOExt + FunctionConfig>(pio: &mut PIO<P>) -> InstalledProgram<P>
 ///     delay_for_at_least_60_microseconds();
 /// };
 ///```
-pub struct Ws2812Direct<P, SM, I, J, CH1, CH2, const BS: usize>
+pub struct Ws2812Direct<P, SM, I, J, CH1, CH2, const BS: usize, T>
 where
     I: PinId,
     J: PinId,
@@ -285,14 +288,18 @@ where
     Function<P>: ValidPinMode<I>,
     Function<P>: ValidPinMode<J>,
     SM: StateMachineIndex,
+    T: embedded_hal::timer::CountDown,
+    T::Time: From<fugit::MicrosDurationU64>,
 {
     tx_transfer:
         Transfer<CH1, CH2, &'static mut LEDBuf<BS>, Tx<(P, SM)>, ReadNext<&'static mut LEDBuf<BS>>>,
     _pin0: Pin<I, Function<P>>,
     _pin1: Pin<J, Function<P>>,
+    timer: T,
+    pub led_us: fugit::MicrosDurationU64,
 }
 
-impl<P, SM, I, J, CH1, CH2, const BS: usize> Ws2812Direct<P, SM, I, J, CH1, CH2, BS>
+impl<P, SM, I, J, CH1, CH2, const BS: usize, T> Ws2812Direct<P, SM, I, J, CH1, CH2, BS, T>
 where
     I: PinId,
     J: PinId,
@@ -302,6 +309,8 @@ where
     Function<P>: ValidPinMode<I>,
     Function<P>: ValidPinMode<J>,
     SM: StateMachineIndex,
+    T: embedded_hal::timer::CountDown,
+    T::Time: From<fugit::MicrosDurationU64>,
 {
     /// Creates a new instance of this driver.
     pub fn new(
@@ -313,6 +322,7 @@ where
         buf1: &'static mut LEDBuf<BS>,
         sm: UninitStateMachine<(P, SM)>,
         clock_freq: fugit::HertzU32,
+        mut timer: T,
     ) -> Self {
         assert!(
             I::DYN.num == J::DYN.num - 1,
@@ -358,6 +368,14 @@ where
             (J::DYN.num, rp2040_hal::pio::PinDir::Output),
         ]);
 
+        // number of us to light one LED
+        let foo: HertzU64 = FREQ.into();
+        let led_us = (foo / 24 / ((buf0.len() / 2).max(buf0.len() / 2) as u32)).into_duration()
+            + 150_u32.micros();
+        info!("poop {}", led_us.to_micros());
+
+        // TODO: fix this buffer size led count nonsense...
+        timer.start(led_us);
         let tx_transfer = Config::new(dma, buf0, tx).start().read_next(buf1);
 
         sm.start();
@@ -366,14 +384,12 @@ where
             tx_transfer,
             _pin0: pin0,
             _pin1: pin1,
+            timer,
+            led_us,
         }
     }
 
-    pub fn write<const S: usize, K, D: DelayUs>(
-        mut self,
-        delayer: &mut D,
-        leds: &LEDs<S, K>,
-    ) -> Self
+    pub fn write<const S: usize, K>(mut self, leds: &LEDs<S, K>) -> Self
     where
         K: Into<RGB8> + Copy,
     {
@@ -384,11 +400,13 @@ where
         let (tx_buf, next_tx_transfer) = self.tx_transfer.wait();
 
         // make sure last value has latched
-        delayer.delay_us(300);
+        block!(self.timer.wait()).unwrap();
 
         leds.fill(tx_buf);
 
         self.tx_transfer = next_tx_transfer.read_next(tx_buf);
+
+        self.timer.start(self.led_us);
 
         self
     }
