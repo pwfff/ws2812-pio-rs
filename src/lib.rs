@@ -13,46 +13,56 @@
 //! Bear in mind that you will have to take care of timing requirements
 //! yourself then.
 
-use cortex_m::{self};
-use fugit::{ExtU32, HertzU32, HertzU64};
+extern crate alloc;
+use alloc::{boxed::Box, vec::Vec};
+use cortex_m::{self, singleton};
+use embedded_dma::ReadBuffer;
+use fugit::{ExtU32, HertzU32, HertzU64, MicrosDurationU64};
 // use morton_encoding::morton_encode;
 use defmt::info;
 use defmt_rtt as _;
 use nb::block;
 use rp2040_hal::{
     dma::{
-        double_buffer::{Config, ReadNext, Transfer},
-        SingleChannel,
+        single_buffer::{Config, Transfer},
+        Channel, ChannelIndex, Channels, SingleChannel, CH0, CH1, CH2, CH3, CH4, CH5, CH6, CH7,
     },
-    gpio::{Function, FunctionConfig, Pin, PinId, ValidPinMode},
-    pio::{InstalledProgram, PIOExt, StateMachineIndex, Tx, UninitStateMachine, PIO},
+    gpio::{bank0::BankPinId, Function, FunctionConfig, Pin, PinId, ValidPinMode},
+    pac::{PIO0, PIO1, RESETS},
+    pio::{
+        InstalledProgram, PIOBuilder, PIOExt, StateMachineIndex, Tx, UninitStateMachine, PIO, SM0,
+        SM1, SM2, SM3,
+    },
 };
-use smart_leds_trait::RGB8;
+use rp_pico::Pins;
+use smart_leds_trait::{RGB, RGB8};
 
 pub struct LEDs<const SIZE: usize, K: Into<RGB8>> {
     pub channel0: [K; SIZE],
     pub channel1: [K; SIZE],
 }
 
-impl<const SIZE: usize, K: Into<RGB8>> LEDs<SIZE, K> {
-    pub fn new(channel0: [K; SIZE], channel1: [K; SIZE]) -> Self {
-        Self { channel0, channel1 }
+impl<const SIZE: usize, K: Into<RGB8> + Default + Copy> LEDs<SIZE, K> {
+    pub fn new() -> Self {
+        assert!(SIZE < MAX_LEDS, "need a bigger buffer for this");
+        Self {
+            channel0: [<K>::default(); SIZE],
+            channel1: [<K>::default(); SIZE],
+        }
     }
 }
 
 // TODO: buffer size only needs to be like... * 3/2?
 #[macro_export]
-macro_rules! buf {
-    ($size:expr) => {
-        singleton!(: [u32; $size * 2] = [0; $size * 2]).unwrap()
-    };
+macro_rules! leds {
+    ($ty:ty, $size:expr) => {{
+        LEDs::<$size, $ty>::new()
+    }};
 }
-
-pub type LEDBuf<const SIZE: usize> = [u32; SIZE];
 
 // https://graphics.stanford.edu/~seander/bithacks.html#InterleaveBMN
 impl<const S: usize, K: Into<RGB8> + Copy> LEDs<S, K> {
-    pub fn fill<const BS: usize>(&self, buf: &mut LEDBuf<BS>) {
+    pub fn fill(&self, buf: &mut [u32; MAX_BUFFER_WORDS]) {
         let mut buf_i = 0;
         for i in 0..S {
             // TODO: faster to encode_u8 thrice,
@@ -252,6 +262,87 @@ pub fn init<P: PIOExt + FunctionConfig>(pio: &mut PIO<P>) -> InstalledProgram<P>
     pio.install(&program).unwrap()
 }
 
+// 1365 LEDs fits in to 1024 bytes
+const MAX_LEDS: usize = 10;
+pub const MAX_BUFFER_SIZE: u16 = 256;
+pub const MAX_BUFFER_WORDS: usize = MAX_BUFFER_SIZE as usize / 4;
+
+pub trait DMATrait {
+    const COUNT: usize;
+
+    fn count(&self) -> usize {
+        Self::COUNT
+    }
+
+    fn bytes(&self) -> u16 {
+        (((Self::COUNT * 24) + 31) / 32) as u16
+    }
+
+    fn words(&self) -> usize {
+        1 << self.ring_size() as usize
+    }
+
+    fn ring_size(&self) -> u8 {
+        16 - self.bytes().leading_zeros() as u8
+    }
+}
+
+impl<const COUNT: usize, K: Into<RGB8>> DMATrait for LEDs<COUNT, K> {
+    const COUNT: usize = COUNT;
+}
+
+// pub const fn trait_size<P: DMATrait>() -> usize {
+//     buf_size(P::COUNT)
+// }
+
+// pub const fn buf_size(count: usize) -> usize {
+//     // bytes we need for this many LEDs, using 24 bits per LED
+//     let bytes: u16 = (((count * 24) + 31) / 32) as u16;
+//     assert!(bytes <= 32768);
+//     // number of u32 words we need for that many bytes
+//     // ((ch0_ring_bytes + 3) / 4) as usize
+
+//     // but we want nearest power of two that will fit
+//     // (to get ring buffer functionality)
+
+//     // u16, so assuming we need 1234 bytes:
+//     // 0b0000 0100 1101 0010 - ch0_bytes
+//     // 0b0000 1000 0000 0000 - nearest power of two
+//     // ch0_bytes.leading_zeros()      = 5
+//     // 16 - ch0_bytes.leading_zeros() = 11
+//     // ring size will be 11
+//     1 << ring_size(bytes as usize) as usize
+// }
+
+pub const fn buf_bytes(count: usize) -> u16 {
+    (((count * 24) + 31) / 32) as u16
+}
+
+pub const fn buf_words(count: usize) -> usize {
+    1 << ring_size(buf_bytes(count) as u16) as usize
+}
+
+pub const fn ring_size(bytes: u16) -> u8 {
+    16 - bytes.leading_zeros() as u8
+}
+
+// pub const fn ring_size(bytes: usize) -> u8 {
+//     // u16, so assuming we need 1234 bytes:
+//     // 0b0000 0100 1101 0010 - 1234 bytes
+//     // 0b0000 1000 0000 0000 - nearest power of two
+//     // bytes.leading_zeros()      = 5
+//     // 16 - bytes.leading_zeros() = 11
+//     // ring size will be 11
+//     16 - bytes.leading_zeros() as u8
+// }
+
+#[macro_export]
+macro_rules! dma_buf {
+    () => {
+        singleton!(: [u32; $crate::MAX_BUFFER_WORDS] = [0; $crate::MAX_BUFFER_WORDS]).unwrap()
+    };
+}
+
 /// This is the WS2812 PIO Driver.
 ///
 /// For blocking applications is recommended to use
@@ -284,58 +375,297 @@ pub fn init<P: PIOExt + FunctionConfig>(pio: &mut PIO<P>) -> InstalledProgram<P>
 ///     delay_for_at_least_60_microseconds();
 /// };
 ///```
-pub struct Ws2812Direct<P, SM, I, J, CH1, CH2, const BS: usize, T>
-where
-    I: PinId,
-    J: PinId,
-    P: PIOExt + FunctionConfig,
-    CH1: SingleChannel,
-    CH2: SingleChannel,
-    Function<P>: ValidPinMode<I>,
-    Function<P>: ValidPinMode<J>,
-    SM: StateMachineIndex,
-    T: embedded_hal::timer::CountDown,
-    T::Time: From<fugit::MicrosDurationU64>,
-{
-    tx_transfer:
-        Transfer<CH1, CH2, &'static mut LEDBuf<BS>, Tx<(P, SM)>, ReadNext<&'static mut LEDBuf<BS>>>,
-    _pin0: Pin<I, Function<P>>,
-    _pin1: Pin<J, Function<P>>,
+pub struct Ws2812Direct<T: embedded_hal::timer::CountDown> {
     timer: T,
-    pub led_us: fugit::MicrosDurationU64,
+    led_us: MicrosDurationU64,
+    t0: Transfer<
+        Channel<CH0>,
+        &'static mut [u32; MAX_BUFFER_WORDS],
+        rp2040_hal::pio::Tx<(PIO0, SM0)>,
+    >,
+    t1: Transfer<
+        Channel<CH1>,
+        &'static mut [u32; MAX_BUFFER_WORDS],
+        rp2040_hal::pio::Tx<(PIO0, SM1)>,
+    >,
+    t2: Transfer<
+        Channel<CH2>,
+        &'static mut [u32; MAX_BUFFER_WORDS],
+        rp2040_hal::pio::Tx<(PIO0, SM2)>,
+    >,
+    t3: Transfer<
+        Channel<CH3>,
+        &'static mut [u32; MAX_BUFFER_WORDS],
+        rp2040_hal::pio::Tx<(PIO0, SM3)>,
+    >,
+    t4: Transfer<
+        Channel<CH4>,
+        &'static mut [u32; MAX_BUFFER_WORDS],
+        rp2040_hal::pio::Tx<(PIO1, SM0)>,
+    >,
+    t5: Transfer<
+        Channel<CH5>,
+        &'static mut [u32; MAX_BUFFER_WORDS],
+        rp2040_hal::pio::Tx<(PIO1, SM1)>,
+    >,
+    t6: Transfer<
+        Channel<CH6>,
+        &'static mut [u32; MAX_BUFFER_WORDS],
+        rp2040_hal::pio::Tx<(PIO1, SM2)>,
+    >,
+    t7: Transfer<
+        Channel<CH7>,
+        &'static mut [u32; MAX_BUFFER_WORDS],
+        rp2040_hal::pio::Tx<(PIO1, SM3)>,
+    >,
 }
 
-impl<P, SM, I, J, CH1, CH2, const BS: usize, T> Ws2812Direct<P, SM, I, J, CH1, CH2, BS, T>
-where
-    I: PinId,
-    J: PinId,
-    P: PIOExt + FunctionConfig,
-    CH1: SingleChannel,
-    CH2: SingleChannel,
-    Function<P>: ValidPinMode<I>,
-    Function<P>: ValidPinMode<J>,
-    SM: StateMachineIndex,
-    T: embedded_hal::timer::CountDown,
-    T::Time: From<fugit::MicrosDurationU64>,
-{
-    /// Creates a new instance of this driver.
-    pub fn new(
-        installed: InstalledProgram<P>,
-        pin0: Pin<I, Function<P>>,
-        pin1: Pin<J, Function<P>>,
-        dma: (CH1, CH2),
-        buf0: &'static mut LEDBuf<BS>,
-        buf1: &'static mut LEDBuf<BS>,
-        sm: UninitStateMachine<(P, SM)>,
-        clock_freq: fugit::HertzU32,
-        mut timer: T,
-    ) -> Self {
+trait Wrapper {
+    fn swap(&mut self, new: [u32; MAX_BUFFER_WORDS]);
+}
+
+struct Builder {
+    led_us: fugit::MicrosDurationU64,
+}
+
+impl Builder {
+    fn init<P: PIOExt + FunctionConfig>(
+        pio: &mut PIO<P>,
+    ) -> (
+        InstalledProgram<P>,
+        InstalledProgram<P>,
+        InstalledProgram<P>,
+        InstalledProgram<P>,
+    ) {
+        let program = init(pio);
+
+        unsafe {
+            (
+                program.share(),
+                program.share(),
+                program.share(),
+                program.share(),
+            )
+        }
+    }
+
+    fn common<P: PIOExt + FunctionConfig>(
+        program: InstalledProgram<P>,
+        int: u16,
+        frac: u8,
+    ) -> PIOBuilder<P> {
+        rp2040_hal::pio::PIOBuilder::from_program(program)
+            // only use TX FIFO
+            .buffers(rp2040_hal::pio::Buffers::OnlyTx)
+            // OSR config
+            .out_shift_direction(rp2040_hal::pio::ShiftDirection::Left)
+            .autopull(true)
+            .clock_divisor_fixed_point(int, frac)
+    }
+
+    fn build<
+        P: PIOExt + FunctionConfig + 'static,
+        A: PinId,
+        B: PinId,
+        C: PinId,
+        D: PinId,
+        E: PinId,
+        F: PinId,
+        G: PinId,
+        H: PinId,
+        W: SingleChannel + 'static,
+        X: SingleChannel + 'static,
+        Y: SingleChannel + 'static,
+        Z: SingleChannel + 'static,
+    >(
+        &self,
+        int: u16,
+        frac: u8,
+        mut split: (
+            PIO<P>,
+            UninitStateMachine<(P, SM0)>,
+            UninitStateMachine<(P, SM1)>,
+            UninitStateMachine<(P, SM2)>,
+            UninitStateMachine<(P, SM3)>,
+        ),
+        dma: (W, X, Y, Z),
+        pins: (
+            Pin<A, Function<P>>,
+            Pin<B, Function<P>>,
+            Pin<C, Function<P>>,
+            Pin<D, Function<P>>,
+            Pin<E, Function<P>>,
+            Pin<F, Function<P>>,
+            Pin<G, Function<P>>,
+            Pin<H, Function<P>>,
+        ),
+        bufs: (
+            &'static mut [u32; MAX_BUFFER_WORDS],
+            &'static mut [u32; MAX_BUFFER_WORDS],
+            &'static mut [u32; MAX_BUFFER_WORDS],
+            &'static mut [u32; MAX_BUFFER_WORDS],
+        ),
+    ) -> (
+        Transfer<W, &'static mut [u32; MAX_BUFFER_WORDS], rp2040_hal::pio::Tx<(P, SM0)>>,
+        Transfer<X, &'static mut [u32; MAX_BUFFER_WORDS], rp2040_hal::pio::Tx<(P, SM1)>>,
+        Transfer<Y, &'static mut [u32; MAX_BUFFER_WORDS], rp2040_hal::pio::Tx<(P, SM2)>>,
+        Transfer<Z, &'static mut [u32; MAX_BUFFER_WORDS], rp2040_hal::pio::Tx<(P, SM3)>>,
+    )
+    where
+        Function<P>: ValidPinMode<A>,
+        Function<P>: ValidPinMode<B>,
+        Function<P>: ValidPinMode<C>,
+        Function<P>: ValidPinMode<D>,
+        Function<P>: ValidPinMode<E>,
+        Function<P>: ValidPinMode<F>,
+        Function<P>: ValidPinMode<G>,
+        Function<P>: ValidPinMode<H>,
+    {
         assert!(
-            I::DYN.num == J::DYN.num - 1,
+            A::DYN.num == B::DYN.num - 1,
+            "Provided pins must be next to each other"
+        );
+        assert!(
+            C::DYN.num == D::DYN.num - 1,
+            "Provided pins must be next to each other"
+        );
+        assert!(
+            E::DYN.num == F::DYN.num - 1,
+            "Provided pins must be next to each other"
+        );
+        assert!(
+            G::DYN.num == H::DYN.num - 1,
             "Provided pins must be next to each other"
         );
 
+        let (p0, p1, p2, p3) = Self::init(&mut split.0);
+
+        let (mut sm0, _, tx0) = Self::common(p0, int, frac)
+            .side_set_pin_base(pins.0.id().num)
+            .build(split.1);
+        sm0.set_pindirs([
+            (pins.0.id().num, rp2040_hal::pio::PinDir::Output),
+            (pins.1.id().num, rp2040_hal::pio::PinDir::Output),
+        ]);
+
+        let (mut sm1, _, tx1) = Self::common(p1, int, frac)
+            .side_set_pin_base(C::DYN.num)
+            .build(split.2);
+        sm1.set_pindirs([
+            (C::DYN.num, rp2040_hal::pio::PinDir::Output),
+            (D::DYN.num, rp2040_hal::pio::PinDir::Output),
+        ]);
+
+        let (mut sm2, _, tx2) = Self::common(p2, int, frac)
+            .side_set_pin_base(E::DYN.num)
+            .build(split.3);
+        sm2.set_pindirs([
+            (E::DYN.num, rp2040_hal::pio::PinDir::Output),
+            (F::DYN.num, rp2040_hal::pio::PinDir::Output),
+        ]);
+
+        let (mut sm3, _, tx3) = Self::common(p3, int, frac)
+            .side_set_pin_base(G::DYN.num)
+            .build(split.4);
+        sm3.set_pindirs([
+            (G::DYN.num, rp2040_hal::pio::PinDir::Output),
+            (H::DYN.num, rp2040_hal::pio::PinDir::Output),
+        ]);
+
+        dma.0
+            .ch()
+            .ch_al1_ctrl
+            .write(|w| unsafe { w.ring_size().bits(ring_size(MAX_BUFFER_SIZE)) });
+
+        dma.1
+            .ch()
+            .ch_al1_ctrl
+            .write(|w| unsafe { w.ring_size().bits(ring_size(MAX_BUFFER_SIZE)) });
+
+        dma.2
+            .ch()
+            .ch_al1_ctrl
+            .write(|w| unsafe { w.ring_size().bits(ring_size(MAX_BUFFER_SIZE)) });
+
+        dma.3
+            .ch()
+            .ch_al1_ctrl
+            .write(|w| unsafe { w.ring_size().bits(ring_size(MAX_BUFFER_SIZE)) });
+
+        sm0.start();
+        sm1.start();
+        sm2.start();
+        sm3.start();
+
+        (
+            Config::new(dma.0, bufs.0, tx0).start(),
+            Config::new(dma.1, bufs.1, tx1).start(),
+            Config::new(dma.2, bufs.2, tx2).start(),
+            Config::new(dma.3, bufs.3, tx3).start(),
+        )
+    }
+}
+
+impl<T: embedded_hal::timer::CountDown> Ws2812Direct<T> {
+    /// Creates a new instance of this driver.
+    pub fn new<
+        A: PinId + BankPinId,
+        B: PinId + BankPinId,
+        C: PinId + BankPinId,
+        D: PinId + BankPinId,
+        E: PinId + BankPinId,
+        F: PinId + BankPinId,
+        G: PinId + BankPinId,
+        H: PinId + BankPinId,
+        I: PinId + BankPinId,
+        J: PinId + BankPinId,
+        K: PinId + BankPinId,
+        L: PinId + BankPinId,
+        M: PinId + BankPinId,
+        N: PinId + BankPinId,
+        O: PinId + BankPinId,
+        P: PinId + BankPinId,
+    >(
+        pio0: PIO0,
+        pio1: PIO1,
+        dma: Channels,
+        resets: &mut RESETS,
+        pins: (
+            Pin<A, Function<PIO0>>,
+            Pin<B, Function<PIO0>>,
+            Pin<C, Function<PIO0>>,
+            Pin<D, Function<PIO0>>,
+            Pin<E, Function<PIO1>>,
+            Pin<F, Function<PIO1>>,
+            Pin<G, Function<PIO1>>,
+            Pin<H, Function<PIO1>>,
+            Pin<I, Function<PIO0>>,
+            Pin<J, Function<PIO0>>,
+            Pin<K, Function<PIO0>>,
+            Pin<L, Function<PIO0>>,
+            Pin<M, Function<PIO1>>,
+            Pin<N, Function<PIO1>>,
+            Pin<O, Function<PIO1>>,
+            Pin<P, Function<PIO1>>,
+        ),
+        bufs: (
+            &'static mut [u32; MAX_BUFFER_WORDS],
+            &'static mut [u32; MAX_BUFFER_WORDS],
+            &'static mut [u32; MAX_BUFFER_WORDS],
+            &'static mut [u32; MAX_BUFFER_WORDS],
+            &'static mut [u32; MAX_BUFFER_WORDS],
+            &'static mut [u32; MAX_BUFFER_WORDS],
+            &'static mut [u32; MAX_BUFFER_WORDS],
+            &'static mut [u32; MAX_BUFFER_WORDS],
+        ),
+        clock_freq: fugit::HertzU32,
+        mut timer: T,
+    ) -> Self
+    where
+        T::Time: From<fugit::MicrosDurationU64>,
+    {
         const CYCLES_PER_BIT: u32 = 16;
+        const WS2812KHZ: u32 = 800;
         const FREQ: HertzU32 = HertzU32::kHz(800);
 
         // Configure the PIO state machine.
@@ -357,61 +687,77 @@ where
         let int: u16 = int as u16;
         let frac: u8 = frac as u8;
 
-        let (mut sm, _, tx) = rp2040_hal::pio::PIOBuilder::from_program(installed)
-            // only use TX FIFO
-            .buffers(rp2040_hal::pio::Buffers::OnlyTx)
-            // Pin configuration
-            .side_set_pin_base(I::DYN.num)
-            // OSR config
-            .out_shift_direction(rp2040_hal::pio::ShiftDirection::Left)
-            .autopull(true)
-            .clock_divisor_fixed_point(int, frac)
-            .build(sm);
-
-        // Prepare pin's direction.
-        sm.set_pindirs([
-            (I::DYN.num, rp2040_hal::pio::PinDir::Output),
-            (J::DYN.num, rp2040_hal::pio::PinDir::Output),
-        ]);
-
         // number of us to light one LED
-        let foo: HertzU64 = FREQ.into();
-        let led_us = (foo / 24 / ((buf0.len() / 2).max(buf0.len() / 2) as u32)).into_duration()
-            + 150_u32.micros();
+        let FREQ_U64: HertzU64 = HertzU64::kHz(WS2812KHZ as u64);
+        let led_us = (FREQ_U64 / 24 / (10 as u32)).into_duration() + 300_u32.micros();
         info!("poop {}", led_us.to_micros());
 
-        // TODO: fix this buffer size led count nonsense...
-        timer.start(led_us);
-        let tx_transfer = Config::new(dma, buf0, tx).start().read_next(buf1);
+        let b = Builder { led_us };
 
-        sm.start();
+        let (ch0, ch1, ch2, ch3) = b.build(
+            int,
+            frac,
+            pio0.split(resets),
+            (dma.ch0, dma.ch1, dma.ch2, dma.ch3),
+            (
+                pins.0.into_mode(),
+                pins.1.into_mode(),
+                pins.2.into_mode(),
+                pins.3.into_mode(),
+                pins.4.into_mode(),
+                pins.5.into_mode(),
+                pins.6.into_mode(),
+                pins.7.into_mode(),
+            ),
+            (bufs.0, bufs.1, bufs.2, bufs.3),
+        );
+
+        let (ch4, ch5, ch6, ch7) = b.build(
+            int,
+            frac,
+            pio1.split(resets),
+            (dma.ch4, dma.ch5, dma.ch6, dma.ch7),
+            (
+                pins.8.into_mode(),
+                pins.9.into_mode(),
+                pins.10.into_mode(),
+                pins.11.into_mode(),
+                pins.12.into_mode(),
+                pins.13.into_mode(),
+                pins.14.into_mode(),
+                pins.15.into_mode(),
+            ),
+            (bufs.4, bufs.5, bufs.6, bufs.7),
+        );
+
+        timer.start(led_us);
 
         Self {
-            tx_transfer,
-            _pin0: pin0,
-            _pin1: pin1,
-            timer,
-            led_us,
+            timer: timer,
+            led_us: led_us,
+            t0: ch0,
+            t1: ch1,
+            t2: ch2,
+            t3: ch3,
+            t4: ch4,
+            t5: ch5,
+            t6: ch6,
+            t7: ch7,
         }
     }
 
-    pub fn write<const S: usize, K>(mut self, leds: &LEDs<S, K>) -> Self
+    pub fn write<K: Into<RGB8> + Clone + Copy, const COUNT: usize>(
+        mut self,
+        leds: &[LEDs<COUNT, K>; 8],
+    ) -> Self
     where
-        K: Into<RGB8> + Copy,
+        T::Time: From<fugit::MicrosDurationU64>,
     {
-        // TODO: ugh just make this an iterator and if it's too big, whatever, i guess?
-        // TODO: double is not right though? it's like... (*2)/3?
-        assert!(BS == S * 2, "buffer sizes must be LED count * 2");
-
-        let (tx_buf, next_tx_transfer) = self.tx_transfer.wait();
-
-        // make sure last value has latched
+        let (a, b, c) = self.t0.wait();
         block!(self.timer.wait()).unwrap();
 
-        leds.fill(tx_buf);
-
-        self.tx_transfer = next_tx_transfer.read_next(tx_buf);
-
+        leds[0].fill(b);
+        self.t0 = Config::new(a, b, c).start();
         self.timer.start(self.led_us);
 
         self
@@ -428,6 +774,17 @@ pub trait DelayUs {
     /// Pauses execution for `us` microseconds
     fn delay_us(&mut self, us: u32);
 }
+
+// struct Foo {
+//     bufuser: Bar,
+//     buf: [u8; 8],
+// }
+
+// struct Bar {
+//     buf: &[u8; 8],
+// }
+
+// fn new_foo() -> Foo {}
 
 /*
 impl<P, SM, I, J, CH1, CH2, const SIZE: usize> SmartLedsWrite
